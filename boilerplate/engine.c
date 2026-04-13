@@ -289,9 +289,23 @@ static void bounded_buffer_begin_shutdown(bounded_buffer_t *buffer)
  */
 int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
+     pthread_mutex_lock(&buffer->mutex);
+
+    while (buffer->count == LOG_BUFFER_CAPACITY && !buffer->shutting_down)
+        pthread_cond_wait(&buffer->not_full, &buffer->mutex);
+
+    if (buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;
+    }
+
+    buffer->items[buffer->tail] = *item;
+    buffer->tail = (buffer->tail + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count++;
+
+    pthread_cond_signal(&buffer->not_empty);
+    pthread_mutex_unlock(&buffer->mutex);
+    return 0;
 }
 
 /*
@@ -305,9 +319,23 @@ int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
  */
 int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
+     pthread_mutex_lock(&buffer->mutex);
+
+    while (buffer->count == 0 && !buffer->shutting_down)
+        pthread_cond_wait(&buffer->not_empty, &buffer->mutex);
+
+    if (buffer->count == 0 && buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;   /* drained and done */
+    }
+
+    *item = buffer->items[buffer->head];
+    buffer->head = (buffer->head + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count--;
+
+    pthread_cond_signal(&buffer->not_full);
+    pthread_mutex_unlock(&buffer->mutex);
+    return 0;
 }
 
 /*
@@ -321,7 +349,22 @@ int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
  */
 void *logging_thread(void *arg)
 {
-    (void)arg;
+    supervisor_ctx_t *ctx = (supervisor_ctx_t *)arg;
+    log_item_t item;
+    char path[PATH_MAX];
+    int fd;
+
+    while (bounded_buffer_pop(&ctx->log_buffer, &item) == 0) {
+        snprintf(path, sizeof(path), "%s/%s.log", LOG_DIR, item.container_id);
+        fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd < 0) {
+            perror("logging_thread: open log file");
+            continue;
+        }
+        write(fd, item.data, item.length);
+        close(fd);
+    }
+
     return NULL;
 }
 
@@ -338,7 +381,44 @@ void *logging_thread(void *arg)
  */
 int child_fn(void *arg)
 {
-    (void)arg;
+    child_config_t *cfg = (child_config_t *)arg;
+
+    /* redirect stdout and stderr into the supervisor logging pipe */
+    if (cfg->log_write_fd >= 0) {
+        dup2(cfg->log_write_fd, STDOUT_FILENO);
+        dup2(cfg->log_write_fd, STDERR_FILENO);
+        close(cfg->log_write_fd);
+    }
+
+    /* set hostname to container id */
+    if (sethostname(cfg->id, strlen(cfg->id)) < 0)
+        perror("sethostname");
+
+    /* chroot into the container's rootfs */
+    if (chroot(cfg->rootfs) < 0) {
+        perror("chroot");
+        return 1;
+    }
+
+    if (chdir("/") < 0) {
+        perror("chdir");
+        return 1;
+    }
+
+    /* mount /proc so ps, top, etc. work inside the container */
+    if (mount("proc", "/proc", "proc", 0, NULL) < 0)
+        perror("mount /proc");   /* non-fatal — continue anyway */
+
+    /* apply nice value if set */
+    if (cfg->nice_value != 0)
+        nice(cfg->nice_value);
+
+    /* exec the requested command */
+    char *args[] = { cfg->command, NULL };
+    execv(cfg->command, args);
+
+    /* if execv returns, something went wrong */
+    perror("execv");
     return 1;
 }
 
